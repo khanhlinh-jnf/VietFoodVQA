@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 from pathlib import Path
 from typing import Any
 
@@ -9,13 +8,57 @@ import streamlit as st
 from supabase import create_client
 
 st.set_page_config(layout="wide")
-st.title("Vietnamese Food VQA - Annotation Tool")
+st.title("Vietnamese Food VQA - Annotation & Verify Tool")
 
 SUPABASE_URL = "https://cvdoasxazyruytejluvv.supabase.co"
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 PAGE_SIZE = 1000
 PROJECT_ROOT = Path(__file__).resolve().parent
 QUESTION_TYPES_CSV = PROJECT_ROOT / "data" / "question_types.csv"
+
+VERIFY_FIELD_CANDIDATES = {
+    "q0": ["q0_score", "verify_q0", "score_q0"],
+    "q1": ["q1_score", "verify_q1", "score_q1"],
+    "q2": ["q2_score", "verify_q2", "score_q2"],
+    "q3": ["q3_score", "verify_q3", "score_q3"],
+    "decision": ["verify_decision", "review_decision", "decision"],
+    "notes": ["verify_notes", "review_notes", "notes", "reviewer_note"],
+    "rule": ["verify_rule", "review_rule"],
+}
+
+VERIFY_OPTIONS: dict[str, dict[int, str]] = {
+    "q0": {
+        1: "1 — Dùng sai triple / nhắc tới thứ không có trong ảnh (DROP)",
+        2: "2 — Không dùng triple",
+        3: "3 — Dùng triple 1-hop",
+        4: "4 — Suy luận 2-hop tốt",
+    },
+    "q1": {
+        1: "1 — Sai cả vị trí và màu sắc (DROP)",
+        2: "2 — Sai 1 trong 2 (DROP)",
+        3: "3 — Đúng nhưng khó hiểu",
+        4: "4 — Hoàn hảo",
+    },
+    "q2": {
+        1: "1 — Đáp án sai",
+        2: "2 — Nhiều đáp án đúng",
+        3: "3 — Đúng nhưng nhiễu yếu",
+        4: "4 — Đúng và nhiễu tốt",
+    },
+    "q3": {
+        1: "1 — Rationale bịa đặt",
+        2: "2 — Rationale chung chung",
+        3: "3 — Rationale đúng logic",
+        4: "4 — Kết nối ảnh - tri thức tường minh",
+    },
+}
+
+VERIFY_TITLES = {
+    "q0": "Q0: KG Alignment",
+    "q1": "Q1: Visual Accuracy",
+    "q2": "Q2: Choice Logic",
+    "q3": "Q3: Rationale",
+}
 
 
 @st.cache_resource
@@ -38,6 +81,53 @@ def norm_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def format_choices_block(row: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"A. {norm_text(row.get('choice_a'))}",
+            f"B. {norm_text(row.get('choice_b'))}",
+            f"C. {norm_text(row.get('choice_c'))}",
+            f"D. {norm_text(row.get('choice_d'))}",
+        ]
+    ).strip()
+
+
+def parse_choices_block(raw_text: str) -> tuple[dict[str, str], list[str]]:
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    parsed: dict[str, str] = {}
+    fallback_values: list[str] = []
+
+    for line in lines:
+        if len(line) >= 2 and line[0].upper() in {'A', 'B', 'C', 'D'} and line[1] in {'.', ')', ':', '-'}:
+            key = line[0].upper()
+            value = line[2:].strip(' .):-\t')
+            if value:
+                parsed[key] = value
+        else:
+            fallback_values.append(line)
+
+    if not parsed and len(fallback_values) == 4:
+        parsed = dict(zip(['A', 'B', 'C', 'D'], fallback_values))
+
+    missing = [key for key in ['A', 'B', 'C', 'D'] if not parsed.get(key)]
+    return parsed, missing
+
+
+def render_image_metadata_block(image_row: dict[str, Any]) -> None:
+    with st.expander("Thông tin ảnh", expanded=False):
+        st.write(f"**image_id:** `{image_row['image_id']}`")
+        foods = image_row.get("food_items") or []
+        st.write("**food_items:**", ", ".join(foods) if foods else "(trống)")
+        st.write("**image_desc:**")
+        st.write(image_row.get("image_desc") or "(trống)")
 
 
 def fetch_all_rows(query_builder, page_size: int = PAGE_SIZE) -> list[dict[str, Any]]:
@@ -86,10 +176,95 @@ def fetch_question_types() -> list[str]:
     return values
 
 
+def find_existing_column(row: dict[str, Any], logical_name: str) -> str | None:
+    for candidate in VERIFY_FIELD_CANDIDATES.get(logical_name, []):
+        if candidate in row:
+            return candidate
+    return None
+
+
+def get_existing_verify_value(row: dict[str, Any], logical_name: str, default: Any = None) -> Any:
+    column = find_existing_column(row, logical_name)
+    if column is None:
+        return default
+    value = row.get(column)
+    return default if value is None else value
+
+
+def build_verify_payload(row: dict[str, Any], scores: dict[str, int], decision: str, notes: str, rule_text: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+
+    mapping = {
+        "q0": scores["q0"],
+        "q1": scores["q1"],
+        "q2": scores["q2"],
+        "q3": scores["q3"],
+        "decision": decision,
+        "notes": notes.strip() or None,
+        "rule": rule_text or None,
+    }
+    for logical_name, value in mapping.items():
+        column = find_existing_column(row, logical_name)
+        if column is not None:
+            payload[column] = value
+    return payload
+
+
+def evaluate_verify(scores: dict[str, int]) -> tuple[str, str, list[str]]:
+    reasons: list[str] = []
+    rule = "PASS"
+    decision = "KEEP"
+
+    if scores["q0"] == 1:
+        decision = "DROP"
+        rule = "Q0=1"
+        reasons.append("Q0 = 1: câu hỏi dùng sai triple hoặc nhắc tới đối tượng không có trong ảnh.")
+
+    if scores["q1"] <= 2:
+        decision = "DROP"
+        if rule == "PASS":
+            rule = "Q1<=2"
+        else:
+            rule = f"{rule} + Q1<=2"
+        reasons.append("Q1 ≤ 2: thông tin thị giác (vị trí / màu sắc) không đạt guideline.")
+
+    if decision == "KEEP":
+        reasons.append("Không kích hoạt luật auto-drop từ guideline hiện tại.")
+
+    if scores["q2"] <= 2:
+        reasons.append("Q2 thấp: nên kiểm tra lại đáp án đúng và chất lượng distractor.")
+    if scores["q3"] <= 2:
+        reasons.append("Q3 thấp: rationale còn yếu hoặc chưa bám sát triple.")
+
+    return decision, rule, reasons
+
+
+def render_verify_summary(scores: dict[str, int]) -> tuple[str, str]:
+    auto_decision, auto_rule, reasons = evaluate_verify(scores)
+    avg_score = sum(scores.values()) / 4
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Q0", scores["q0"])
+    metric_cols[1].metric("Q1", scores["q1"])
+    metric_cols[2].metric("Q2", scores["q2"])
+    metric_cols[3].metric("Q3", scores["q3"])
+    metric_cols[4].metric("Avg", f"{avg_score:.2f}")
+
+    if auto_decision == "DROP":
+        st.error(f"Khuyến nghị theo guideline: DROP ({auto_rule})")
+    else:
+        st.success("Khuyến nghị theo guideline: KEEP")
+
+    for reason in reasons:
+        st.write(f"- {reason}")
+
+    return auto_decision, auto_rule
+
+
 def load_image_annotation_page() -> None:
     st.sidebar.header("Chọn ảnh")
     start_id = st.sidebar.text_input("Từ ID (VD: image000000):", value="image000000", key="img_start")
-    end_id = st.sidebar.text_input("Đến ID (VD: image000100):", value="image001000", key="img_end")
+    end_id = st.sidebar.text_input("Đến ID (VD: image001000):", value="image001000", key="img_end")
 
     st.sidebar.markdown("---")
     filter_is_drop = st.sidebar.selectbox(
@@ -330,10 +505,10 @@ def render_evidence_block(triples_used: list[dict[str, Any]]) -> None:
                 st.caption("Không có source_url.")
 
 
-def load_vqa_annotation_page() -> None:
-    st.sidebar.header("Chọn VQA")
+def load_vqa_verify_page() -> None:
+    st.sidebar.header("Verify VQA")
     start_id = st.sidebar.text_input("Từ ID ảnh (VD: image000000):", value="image000000", key="vqa_start")
-    end_id = st.sidebar.text_input("Đến ID ảnh (VD: image000100):", value="image000100", key="vqa_end")
+    end_id = st.sidebar.text_input("Đến ID ảnh (VD: image001000):", value="image001000", key="vqa_end")
 
     st.sidebar.markdown("---")
     filter_is_drop = st.sidebar.selectbox(
@@ -357,6 +532,25 @@ def load_vqa_annotation_page() -> None:
         key="vqa_qtype_filter",
     )
 
+    with st.expander("Rubric verify", expanded=False):
+        st.markdown(
+            """
+**Q0 - KG Alignment**  
+1: dùng sai / nhắc tới thứ không có trong ảnh; 2: không dùng triple; 3: dùng 1-hop; 4: suy luận 2-hop.  
+**Luật:** Q0 = 1 → DROP
+
+**Q1 - Visual Accuracy**  
+1: sai cả 2; 2: sai 1 trong 2; 3: đúng nhưng khó hiểu; 4: hoàn hảo.  
+**Luật:** Q1 ≤ 2 → DROP
+
+**Q2 - Choice Logic**  
+1: đáp án sai; 2: nhiều đáp án đúng; 3: đúng nhưng nhiễu yếu; 4: đúng + nhiễu tốt.
+
+**Q3 - Rationale**  
+1: bịa đặt; 2: chung chung; 3: đúng logic; 4: kết nối ảnh-tri thức tường minh.
+            """
+        )
+
     vqa_rows, image_map = fetch_vqa_rows(start_id, end_id, filter_is_drop, filter_is_checked, qtype_filter)
     if not vqa_rows:
         st.warning("Không có VQA nào khớp với điều kiện lọc hiện tại!")
@@ -377,7 +571,7 @@ def load_vqa_annotation_page() -> None:
         return f"{row['image_id']} | {row.get('qtype') or '-'} | #{vqa_id} | {preview}"
 
     selected_vqa_id = st.sidebar.selectbox(
-        "Chọn VQA để xem/sửa:",
+        "Chọn VQA để verify:",
         vqa_ids,
         format_func=format_vqa_option,
         key="selected_vqa_id",
@@ -401,77 +595,138 @@ def load_vqa_annotation_page() -> None:
         f"**Đang xử lý VQA ID:** `{selected_vqa_id}` | **Ảnh:** `{vqa_row['image_id']}` | **Vị trí:** {current_idx}/{total_filtered} | {checked_text} | {drop_text}"
     )
 
-    col1, col2 = st.columns([1, 1])
+    main_left, main_right = st.columns([1.05, 1.15])
 
-    with col1:
+    default_scores = {
+        "q0": safe_int(get_existing_verify_value(vqa_row, "q0", 3), 3),
+        "q1": safe_int(get_existing_verify_value(vqa_row, "q1", 4), 4),
+        "q2": safe_int(get_existing_verify_value(vqa_row, "q2", 3), 3),
+        "q3": safe_int(get_existing_verify_value(vqa_row, "q3", 3), 3),
+    }
+
+    with main_left:
         st.image(image_row["image_url"], use_container_width=True)
-        st.markdown("---")
-        st.subheader("Thông tin ảnh")
-        st.write(f"**image_id:** `{image_row['image_id']}`")
-        foods = image_row.get("food_items") or []
-        st.write("**food_items:**", ", ".join(foods) if foods else "(trống)")
-        st.write("**image_desc:**")
-        st.write(image_row.get("image_desc") or "(trống)")
-        st.markdown("---")
-        render_evidence_block(vqa_row.get("triples_used") or [])
+        render_image_metadata_block(image_row)
+        with st.expander("Evidence từ Knowledge Graph", expanded=False):
+            render_evidence_block(vqa_row.get("triples_used") or [])
 
-    with col2:
-        old_drop_status = bool(vqa_row.get("is_drop"))
-        keep_vqa = st.radio(
-            "Có nên giữ lại VQA này không?",
-            ("Có", "Không"),
-            index=1 if old_drop_status else 0,
-            horizontal=True,
-            key=f"keep_vqa_{selected_vqa_id}",
-        )
+    with main_right:
+        st.subheader("Verify VQA")
+        tab_content, tab_verify = st.tabs(["Nội dung câu hỏi", "Phiếu verify"])
 
-        valid_qtypes = fetch_question_types()
-        current_qtype = norm_text(vqa_row.get("qtype"))
-        if not valid_qtypes:
-            st.error("Không đọc được danh sách question type hợp lệ từ data/question_types.csv")
-            st.stop()
-        if current_qtype not in valid_qtypes and current_qtype:
-            st.warning(f"qtype hiện tại không nằm trong question_types.csv: {current_qtype}")
-        qtype_index = valid_qtypes.index(current_qtype) if current_qtype in valid_qtypes else 0
-        qtype_input = st.selectbox(
-            "Question type",
-            valid_qtypes,
-            index=qtype_index,
-            key=f"qtype_{selected_vqa_id}",
-        )
-        question_input = st.text_area("Question", value=vqa_row.get("question") or "", height=120, key=f"question_{selected_vqa_id}")
-        choice_a = st.text_input("Choice A", value=vqa_row.get("choice_a") or "", key=f"choice_a_{selected_vqa_id}")
-        choice_b = st.text_input("Choice B", value=vqa_row.get("choice_b") or "", key=f"choice_b_{selected_vqa_id}")
-        choice_c = st.text_input("Choice C", value=vqa_row.get("choice_c") or "", key=f"choice_c_{selected_vqa_id}")
-        choice_d = st.text_input("Choice D", value=vqa_row.get("choice_d") or "", key=f"choice_d_{selected_vqa_id}")
+        with tab_content:
+            valid_qtypes = fetch_question_types()
+            current_qtype = norm_text(vqa_row.get("qtype"))
+            if not valid_qtypes:
+                st.error("Không đọc được danh sách question type hợp lệ từ data/question_types.csv")
+                st.stop()
+            if current_qtype not in valid_qtypes and current_qtype:
+                st.warning(f"qtype hiện tại không nằm trong question_types.csv: {current_qtype}")
+            qtype_index = valid_qtypes.index(current_qtype) if current_qtype in valid_qtypes else 0
 
-        answer_letters = ["A", "B", "C", "D"]
-        answer_default = vqa_row.get("answer") if vqa_row.get("answer") in answer_letters else "A"
-        answer_input = st.selectbox(
-            "Đáp án đúng",
-            answer_letters,
-            index=answer_letters.index(answer_default),
-            key=f"answer_{selected_vqa_id}",
-        )
-        rationale_input = st.text_area(
-            "Rationale",
-            value=vqa_row.get("rationale") or "",
-            height=180,
-            key=f"rationale_{selected_vqa_id}",
-        )
+            top_row_left, top_row_right = st.columns([1.2, 0.8])
+            with top_row_left:
+                qtype_input = st.selectbox(
+                    "Question type",
+                    valid_qtypes,
+                    index=qtype_index,
+                    key=f"qtype_{selected_vqa_id}",
+                )
+            with top_row_right:
+                answer_letters = ["A", "B", "C", "D"]
+                answer_default = vqa_row.get("answer") if vqa_row.get("answer") in answer_letters else "A"
+                answer_input = st.selectbox(
+                    "Đáp án đúng",
+                    answer_letters,
+                    index=answer_letters.index(answer_default),
+                    key=f"answer_{selected_vqa_id}",
+                )
+
+            question_input = st.text_area(
+                "Question",
+                value=vqa_row.get("question") or "",
+                height=110,
+                key=f"question_{selected_vqa_id}",
+            )
+
+            choices_block_input = st.text_area(
+                "Choices (mỗi lựa chọn một dòng, theo dạng A./B./C./D.)",
+                value=format_choices_block(vqa_row),
+                height=130,
+                help="Ví dụ:\nA. Phương pháp hấp\nB. Phương pháp kho\nC. Phương pháp luộc\nD. Phương pháp nướng",
+                key=f"choices_block_{selected_vqa_id}",
+            )
+            parsed_choices, missing_choice_labels = parse_choices_block(choices_block_input)
+            if missing_choice_labels:
+                st.warning("Choices chưa đúng định dạng hoặc còn thiếu: " + ", ".join(missing_choice_labels))
+
+            with st.expander("Rationale", expanded=False):
+                rationale_input = st.text_area(
+                    "Rationale",
+                    value=vqa_row.get("rationale") or "",
+                    height=140,
+                    key=f"rationale_{selected_vqa_id}",
+                )
+
+        with tab_verify:
+            st.subheader("Phiếu verify theo guideline")
+            score_cols = st.columns(2)
+            score_keys = ["q0", "q1", "q2", "q3"]
+            score_inputs: dict[str, int] = {}
+            for idx, score_key in enumerate(score_keys):
+                target_col = score_cols[idx % 2]
+                with target_col:
+                    score_inputs[score_key] = st.selectbox(
+                        VERIFY_TITLES[score_key],
+                        options=[1, 2, 3, 4],
+                        index=max(0, min(3, default_scores[score_key] - 1)),
+                        format_func=lambda value, sk=score_key: VERIFY_OPTIONS[sk][value],
+                        key=f"{score_key}_{selected_vqa_id}",
+                    )
+
+            auto_decision, auto_rule = render_verify_summary(score_inputs)
+
+            existing_decision = norm_text(get_existing_verify_value(vqa_row, "decision", auto_decision)).upper()
+            decision_options = ["AUTO", "KEEP", "DROP"]
+            if existing_decision not in {"KEEP", "DROP"}:
+                decision_index = 0
+            else:
+                decision_index = decision_options.index(existing_decision)
+
+            final_decision_mode = st.radio(
+                "Quyết định cuối cùng",
+                decision_options,
+                index=decision_index,
+                horizontal=True,
+                captions=["Dùng khuyến nghị từ rubric", "Giữ lại", "Drop"],
+                key=f"decision_mode_{selected_vqa_id}",
+            )
+            final_decision = auto_decision if final_decision_mode == "AUTO" else final_decision_mode
+            st.info(f"Kết quả sẽ lưu: **{final_decision}**")
+
+            default_notes = norm_text(get_existing_verify_value(vqa_row, "notes", ""))
+            verify_notes_input = st.text_area(
+                "Ghi chú verify",
+                value=default_notes,
+                height=100,
+                placeholder="Ví dụ: distractor C quá yếu; rationale chưa dẫn chiếu rõ triple 2...",
+                key=f"verify_notes_{selected_vqa_id}",
+            )
 
     st.markdown("---")
     if st.button("Lưu VQA", type="primary", use_container_width=True, key="save_vqa_page"):
+        parsed_choices, missing_choice_labels = parse_choices_block(choices_block_input)
+
         payload = {
             "qtype": qtype_input.strip(),
             "question": question_input.strip(),
-            "choice_a": choice_a.strip(),
-            "choice_b": choice_b.strip(),
-            "choice_c": choice_c.strip(),
-            "choice_d": choice_d.strip(),
+            "choice_a": parsed_choices.get("A", "").strip(),
+            "choice_b": parsed_choices.get("B", "").strip(),
+            "choice_c": parsed_choices.get("C", "").strip(),
+            "choice_d": parsed_choices.get("D", "").strip(),
             "answer": answer_input,
             "rationale": rationale_input.strip() or None,
-            "is_drop": True if keep_vqa == "Không" else False,
+            "is_drop": final_decision == "DROP",
             "is_checked": True,
         }
 
@@ -486,10 +741,22 @@ def load_vqa_annotation_page() -> None:
         ]:
             if not payload[key]:
                 required_errors.append(label)
+        if missing_choice_labels:
+            required_errors.append("Choices block phải đủ A/B/C/D")
 
         if required_errors:
             st.error("Các trường bắt buộc còn trống: " + ", ".join(required_errors))
             st.stop()
+
+        payload.update(
+            build_verify_payload(
+                row=vqa_row,
+                scores=score_inputs,
+                decision=final_decision,
+                notes=verify_notes_input,
+                rule_text=auto_rule,
+            )
+        )
 
         try:
             supabase.table("vqa").update(payload).eq("vqa_id", selected_vqa_id).execute()
@@ -505,13 +772,13 @@ def load_vqa_annotation_page() -> None:
 
 page = st.sidebar.radio(
     "Chế độ",
-    ["Annotate Food Items", "Annotate VQA"],
+    ["Verify Food Items", "Verify VQA"],
     index=1,
 )
 
 st.sidebar.markdown("---")
 
-if page == "Annotate Food Items":
+if page == "Verify Food Items":
     load_image_annotation_page()
 else:
-    load_vqa_annotation_page()
+    load_vqa_verify_page()
