@@ -504,6 +504,7 @@ def ensure_catalog_triple(triple: dict[str, Any], parent_triple_id: int | None =
         "evidence": triple.get("evidence"),
         "source_url": triple.get("source_url"),
     }
+
     if column_exists("kg_triple_catalog", "is_checked"):
         payload["is_checked"] = False
     if column_exists("kg_triple_catalog", "is_drop"):
@@ -517,15 +518,19 @@ def ensure_catalog_triple(triple: dict[str, Any], parent_triple_id: int | None =
     if column_exists("kg_triple_catalog", "updated_at"):
         payload["updated_at"] = now_iso()
 
-    resp, err = execute_query(
-        supabase.table("kg_triple_catalog").upsert(payload, on_conflict="subject,relation,target").select("triple_id").limit(1)
+    _, err = execute_query(
+        supabase.table("kg_triple_catalog").upsert(
+            payload,
+            on_conflict="subject,relation,target",
+        )
     )
-    if err is None and resp.data:
-        return safe_int(resp.data[0].get("triple_id"), 0) or None
+    if err is not None:
+        return None
 
     existing = find_catalog_triple(triple["subject"], triple["relation"], triple["target"])
     if existing:
         return safe_int(existing.get("triple_id"), 0) or None
+
     return None
 
 
