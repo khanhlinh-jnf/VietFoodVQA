@@ -386,6 +386,43 @@ def render_verify_summary(scores: dict[str, int]) -> tuple[str, str]:
 
     return auto_decision, auto_rule
 
+def fetch_vqa_range_progress(
+    start_vqa_id: int,
+    end_vqa_id: int,
+    split_filter: str,
+) -> dict[str, int]:
+    select_cols = "vqa_id,is_checked"
+
+    if column_exists("vqa", "split"):
+        select_cols += ",split"
+
+    query = (
+        supabase.table("vqa")
+        .select(select_cols)
+        .gte("vqa_id", start_vqa_id)
+        .lte("vqa_id", end_vqa_id)
+        .order("vqa_id")
+    )
+
+    if split_filter != "Tất cả" and column_exists("vqa", "split"):
+        query = query.eq("split", split_filter)
+
+    resp, err = execute_query(query)
+    if err is not None:
+        raise err
+
+    rows = resp.data or []
+
+    total_assigned = len(rows)
+    verified_count = sum(1 for row in rows if row.get("is_checked") is True)
+    unverified_count = total_assigned - verified_count
+
+    return {
+        "total_assigned": total_assigned,
+        "verified_count": verified_count,
+        "unverified_count": unverified_count,
+    }
+
 def fetch_vqa_rows(
     start_vqa_id: int,
     end_vqa_id: int,
@@ -1024,6 +1061,39 @@ def load_vqa_verify_page() -> None:
             st.warning("`Từ VQA ID` phải nhỏ hơn hoặc bằng `Đến VQA ID`.")
             return
 
+        try:
+            range_progress = fetch_vqa_range_progress(
+                start_vqa_id=start_vqa_id,
+                end_vqa_id=end_vqa_id,
+                split_filter=split_filter,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Không tính được tiến độ range được giao: {exc}")
+            return
+
+        total_assigned = range_progress["total_assigned"]
+        verified_count = range_progress["verified_count"]
+        unverified_count = range_progress["unverified_count"]
+
+        if total_assigned > 0:
+            progress_ratio = verified_count / total_assigned
+        else:
+            progress_ratio = 0.0
+
+        st.markdown("### Tiến độ range được giao")
+
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        metric_col1.metric("Đã verify", verified_count)
+        metric_col2.metric("Chưa verify", unverified_count)
+        metric_col3.metric("Tổng được giao", total_assigned)
+
+        st.progress(progress_ratio)
+        st.caption(
+            f"Tiến độ hiện tại: {verified_count}/{total_assigned} VQA đã được verify "
+            f"trong range `{start_vqa_id} → {end_vqa_id}`"
+            + (f" | split: `{split_filter}`" if split_filter != "Tất cả" else "")
+        )
+
         vqa_rows, image_map = fetch_vqa_rows(
             start_vqa_id,
             end_vqa_id,
@@ -1032,9 +1102,18 @@ def load_vqa_verify_page() -> None:
             qtype_filter,
             split_filter,
         )
+        
     except Exception as exc:  # noqa: BLE001
         st.error(f"Không tải được danh sách VQA: {exc}")
         return
+
+    filtered_total = len(vqa_rows)
+
+    st.info(
+        f"Đang hiển thị {filtered_total} VQA khớp với bộ lọc hiện tại "
+        f"(is_drop / is_checked / qtype / split) "
+        f"trong tổng {total_assigned} VQA của range được giao."
+    )
 
     if not vqa_rows:
         st.warning("Không có VQA nào khớp với điều kiện lọc hiện tại!")
